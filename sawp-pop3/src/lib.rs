@@ -46,6 +46,8 @@
 //! }
 //! ```
 
+use nom::branch::alt;
+use nom::character::complete::alphanumeric1;
 /// Re-export of the `Flags` struct that is used to represent bit flags
 /// in this crate.
 pub use sawp_flags::{Flag, Flags};
@@ -63,11 +65,11 @@ mod ffi;
 #[cfg(feature = "ffi")]
 use sawp_ffi::GenerateFFI;
 
-use nom::bytes::complete::{is_not, take_until};
-use nom::character::complete::{char, crlf};
-use nom::combinator::opt;
-use nom::multi::many_till;
-use nom::sequence::{pair, preceded, terminated};
+use nom::bytes::streaming::tag;
+use nom::character::streaming::{alpha1, char, crlf, not_line_ending, space1};
+use nom::combinator::{eof, map, opt, peek};
+use nom::multi::{many_till, separated_list0};
+use nom::sequence::{delimited, terminated};
 use std::convert::TryFrom;
 
 pub const CRLF: &[u8] = b"\r\n";
@@ -268,27 +270,30 @@ impl POP3 {
     }
 
     fn client_command_too_long(command_length: usize, client_payload_length: usize) -> bool {
-        command_length + SPACE.len() + client_payload_length + CRLF.len() > CLIENT_COMMAND_MAX_LEN
+        command_length + client_payload_length + CRLF.len() > CLIENT_COMMAND_MAX_LEN
     }
 
     fn parse_response(input: &[u8]) -> Result<(&[u8], Message)> {
         let mut flags: Flags<ErrorFlag> = ErrorFlag::none();
 
-        let (input, raw_status) = terminated(is_not(" \r"), opt(char(' ')))(input)?;
+        let (input, raw_status) = terminated(alt((tag("+OK"), tag("-ERR"))), opt(space1))(input)?;
         let status = Status::try_from(raw_status)?;
-        let first_line = terminated(take_until(CRLF), crlf);
-        let additional_line = terminated(preceded(opt(char('.')), take_until(CRLF)), crlf);
-        let termination_line = pair(char('.'), crlf);
-        let (input, (header, data)) = pair(
-            first_line,
-            opt(many_till(additional_line, termination_line)),
-        )(input)?;
 
+        let (input, header) = terminated(not_line_ending, crlf)(input)?;
         let header = header.to_vec();
-        let data: Vec<Vec<u8>> = match data {
-            None => vec![],
-            Some((x, _)) => x.iter().map(|x| x.to_vec()).collect(),
-        };
+
+        // This is complicated, because without knowing the command, don't know if response is multiline
+        // Will fail in the case that input has only the header, but is a multiline response
+        let non_multiline = map(alt((eof, peek(tag("+OK")), peek(tag("-ERR")))), |_| vec![]);
+        let multiline = delimited(opt(char('.')), not_line_ending, crlf);
+        let multiline_terminator = tag(".\r\n");
+        let multilines = map(many_till(multiline, multiline_terminator), |(lines, _)| {
+            lines
+        });
+
+        let (input, data) = alt((non_multiline, multilines))(input)?;
+
+        let data: Vec<Vec<u8>> = data.iter().map(|x| x.to_vec()).collect();
 
         if POP3::server_response_too_long(raw_status.len(), header.len()) {
             flags |= ErrorFlag::ResponseTooLong;
@@ -309,14 +314,12 @@ impl POP3 {
     fn parse_command(input: &[u8]) -> Result<(&[u8], Message)> {
         let mut flags: Flags<ErrorFlag> = ErrorFlag::none();
 
-        let (input, raw_keyword) = terminated(is_not(" \r"), opt(char(' ')))(input)?;
+        let (input, raw_keyword) = terminated(alpha1, opt(space1))(input)?;
         let keyword = Keyword::try_from(raw_keyword)?;
-        let (input, raw_args) = terminated(take_until(CRLF), crlf)(input)?;
-        let args: Vec<Vec<u8>> = raw_args
-            .split(|&x| x == b' ')
-            .map(|x| x.to_vec())
-            .filter(|x| !x.is_empty())
-            .collect();
+
+        let (input, args) = separated_list0(space1, alphanumeric1)(input)?;
+        let (input, _) = crlf(input)?;
+        let args: Vec<Vec<u8>> = args.iter().map(|x| x.to_vec()).collect();
 
         // Apply IncorrectArgumentNum flag if necessary, depending on the specific client command used
         match &keyword {
@@ -356,7 +359,10 @@ impl POP3 {
             Keyword::Unknown(_) => flags |= ErrorFlag::UnknownKeyword,
         }
 
-        if POP3::client_command_too_long(raw_keyword.len(), raw_args.len()) {
+        let args_len = args
+            .iter()
+            .fold(0, |acc, c| acc + c.len() + 1 /* for space seperator */);
+        if POP3::client_command_too_long(raw_keyword.len(), args_len) {
             flags |= ErrorFlag::CommandTooLong;
         }
 
