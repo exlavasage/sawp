@@ -50,7 +50,7 @@
 /// in this crate.
 pub use sawp_flags::{Flag, Flags};
 
-use sawp::error::{Error, ErrorKind, Result};
+use sawp::error::{Error, ErrorKind, Needed, Result};
 use sawp::parser::{Direction, Parse};
 use sawp::probe::{Probe, Status as ProbeStatus};
 use sawp::protocol::Protocol;
@@ -385,12 +385,37 @@ impl<'a> Parse<'a> for POP3 {
                 Ok((input, Some(msg)))
             }
             Direction::Unknown => {
-                // Can't use nom::branch::alt since parse_* return sawp::error
-                if let Ok((input, msg)) = POP3::parse_command(input) {
-                    Ok((input, Some(msg)))
-                } else {
-                    let (input, msg) = POP3::parse_response(input)?;
-                    Ok((input, Some(msg)))
+                match (POP3::parse_command(input), POP3::parse_response(input)) {
+                    (Ok((input, msg)), _) => Ok((input, Some(msg))),
+                    (_, Ok((input, msg))) => Ok((input, Some(msg))),
+                    (
+                        Err(Error {
+                            kind: ErrorKind::Incomplete(req_needed),
+                        }),
+                        Err(Error {
+                            kind: ErrorKind::Incomplete(resp_needed),
+                        }),
+                    ) => match (req_needed, resp_needed) {
+                        (Needed::Unknown, resp) => Err(Error::new(ErrorKind::Incomplete(resp))),
+                        (req, Needed::Unknown) => Err(Error::new(ErrorKind::Incomplete(req))),
+                        (Needed::Size(req), Needed::Size(resp)) if req < resp => {
+                            Err(Error::incomplete_needed(req.into()))
+                        }
+                        (_, resp) => Err(Error::new(ErrorKind::Incomplete(resp))),
+                    },
+                    (
+                        Err(Error {
+                            kind: ErrorKind::Incomplete(size),
+                        }),
+                        _,
+                    ) => Err(Error::new(ErrorKind::Incomplete(size))),
+                    (
+                        _,
+                        Err(Error {
+                            kind: ErrorKind::Incomplete(size),
+                        }),
+                    ) => Err(Error::new(ErrorKind::Incomplete(size))),
+                    (Err(e), _) => Err(e), // with no direction and not incomplete, either error is as good as the other
                 }
             }
         }
