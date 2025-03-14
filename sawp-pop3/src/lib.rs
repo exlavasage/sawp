@@ -50,9 +50,9 @@
 /// in this crate.
 pub use sawp_flags::{Flag, Flags};
 
-use sawp::error::{Error, Result};
+use sawp::error::{Error, ErrorKind, Result};
 use sawp::parser::{Direction, Parse};
-use sawp::probe::Probe;
+use sawp::probe::{Probe, Status as ProbeStatus};
 use sawp::protocol::Protocol;
 use sawp_flags::BitFlags;
 
@@ -234,7 +234,24 @@ pub struct Message {
 
 pub struct POP3 {}
 
-impl<'a> Probe<'a> for POP3 {}
+impl<'a> Probe<'a> for POP3 {
+    fn probe(&self, input: &'a [u8], direction: Direction) -> ProbeStatus {
+        match self.parse(input, direction) {
+            Ok((_, Some(msg))) => {
+                if msg.error_flags == ErrorFlag::none() {
+                    ProbeStatus::Recognized
+                } else {
+                    ProbeStatus::Unrecognized
+                }
+            }
+            Ok((_, _)) => ProbeStatus::Recognized,
+            Err(Error {
+                kind: ErrorKind::Incomplete(_),
+            }) => ProbeStatus::Incomplete,
+            Err(_) => ProbeStatus::Unrecognized,
+        }
+    }
+}
 
 impl Protocol<'_> for POP3 {
     type Message = Message;
@@ -385,7 +402,6 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use sawp::error::Error;
-    use sawp::probe::Status as ProbeStatus;
 
     #[test]
     fn test_name() {
