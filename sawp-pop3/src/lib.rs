@@ -383,9 +383,9 @@ impl<'a> Parse<'a> for POP3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nom::error::ErrorKind;
     use rstest::rstest;
-    use sawp::error::{Error, NomError};
+    use sawp::error::Error;
+    use sawp::probe::Status as ProbeStatus;
 
     #[test]
     fn test_name() {
@@ -395,8 +395,120 @@ mod tests {
     #[rstest(
         input,
         expected,
-        case::empty(b"", Err(Error::from(NomError::new(b"" as &[u8], ErrorKind::Many0)))),
-        case::hello_world(b"hello world", Err(Error::from(NomError::new(b"\x01\x02\x03\x04 world" as &[u8], ErrorKind::Tag)))),
+        case::empty(b"", Err(Error::incomplete_needed(3))),
+        case::incomplete_ok(b"+OK", Err(Error::incomplete_needed(1))),
+        case::incomplete_err(b"-ERR ", Err(Error::incomplete_needed(1))),
+        case::ok(
+            b"+OK 2 200\r\n",
+            Ok((b"".as_ref(),
+                Some(Message {
+                        error_flags: ErrorFlag::none(),
+                        inner: InnerMessage::Response(Response {
+                            status: Status::OK,
+                            header: b"2 200".to_vec(),
+                            data: vec![],
+                        }),
+                    },
+                ),
+            ))),
+        case::multiple_responses(b"+OK 2 200\r\n+OK 3 300\r\n",
+            Ok((b"+OK 3 300\r\n".as_ref(),
+                Some(Message {
+                        error_flags: ErrorFlag::none(),
+                        inner: InnerMessage::Response(Response {
+                            status: Status::OK,
+                            header: b"2 200".to_vec(),
+                            data: vec![],
+                        }),
+                    },
+                ),
+            ))),
+    case::multiline(
+        b"+OK Capability list follows\r\nTOP\r\nUSER\r\nUIDL\r\n.\r\n",
+        Ok((b"".as_ref(),
+            Some(Message {
+                    error_flags: ErrorFlag::none(),
+                    inner: InnerMessage::Response(Response {
+                        status: Status::OK,
+                        header: b"Capability list follows".to_vec(),
+                        data: vec![
+                            b"TOP".to_vec(),
+                            b"USER".to_vec(),
+                            b"UIDL".to_vec(),
+                        ],
+                    }),
+                },
+            ),
+        ))),
+    case::multline_byte_stuffing(
+        b"+OK 120 octets\r\n\
+        Grocery list:\r\n\
+        ..6kg of flour\r\n\
+        .\r\n",
+        Ok((b"".as_ref(),
+            Some(Message {
+                    error_flags: ErrorFlag::none(),
+                    inner: InnerMessage::Response(Response {
+                        status: Status::OK,
+                        header: b"120 octets".to_vec(),
+                        data: vec![
+                            b"Grocery list:".to_vec(),
+                            b".6kg of flour".to_vec(),
+                        ],
+                    }),
+                },
+            ),
+        ))),
+    case::incomplete_multiline(
+        b"+OK Capability list follows\r\nTOP\r\n",
+        Err(Error::incomplete_needed(3))
+    ),
+    case::too_long(
+        b"-ERR 12345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890\r\n",
+        Ok((b"".as_ref(),
+            Some(Message {
+                    error_flags: ErrorFlag::ResponseTooLong.into(),
+                    inner: InnerMessage::Response(Response {
+                        status: Status::ERR,
+                        header: b"12345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890 \
+                                123456789012345678901234567890123456789012345678901234567890"
+                                .to_vec(),
+                        data: vec![],
+                    }),
+                },
+            ),
+        ))),
+    case::server_response_invalid_status(
+        b"+SUCCESS 2 200\r\n",
+        Err(Error::parse(Some("Keyword is response".to_string())))),
+    )]
+    fn test_parse_response(input: &[u8], expected: Result<(&[u8], Option<Message>)>) {
+        let pop3 = POP3 {};
+        assert_eq!(pop3.parse(input, Direction::ToClient), expected);
+    }
+
+    #[rstest(
+        input,
+        expected,
+        case::empty(b"", Err(Error::incomplete_needed(1))),
+        case::incomplete(b"TOP", Err(Error::incomplete_needed(1))),
         case::unknown_keyword(
             b"HELLO WORLD\r\n", 
             Ok((b"".as_ref(),
@@ -416,7 +528,7 @@ mod tests {
             Err(
                 Error::parse(Some("Invalid Keyword".to_string()))
             )),
-        case::client_command_no_args(
+        case::no_args(
             b"CAPA\r\n",
             Ok((b"".as_ref(),
                 Some(Message {
@@ -428,7 +540,7 @@ mod tests {
                     },
                 ),
             ))),
-        case::client_command_one_arg(
+        case::one_arg(
             b"DELE 52\r\n",
             Ok((b"".as_ref(),
                 Some(Message {
@@ -442,7 +554,7 @@ mod tests {
                     },
                 ),
             ))),
-        case::client_command_two_args(
+        case::two_args(
             b"APOP sawp 05aaf79d37225973a00cddaaf568eb96\r\n",
             Ok((b"".as_ref(),
                 Some(Message {
@@ -457,7 +569,7 @@ mod tests {
                     },
                 ),
             ))),
-        case::client_command_too_long(
+        case::too_long(
             b"PASS 12345678901234567890123456789012345678901234567890\
             123456789012345678901234567890123456789012345678901234567890\
             123456789012345678901234567890123456789012345678901234567890\
@@ -479,7 +591,7 @@ mod tests {
                     },
                 ),
             ))),
-        case::client_command_missing_argument(
+        case::missing_argument(
             b"DELE\r\n",
             Ok((b"".as_ref(),
                 Some(Message {
@@ -491,7 +603,7 @@ mod tests {
                     },
                 ),
             ))),
-        case::client_command_missing_argument(
+        case::missing_argument(
             b"CAPA HELLO WORLD\r\n",
             Ok((b"".as_ref(),
                 Some(Message {
@@ -506,93 +618,46 @@ mod tests {
                     },
                 ),
             ))),
-        case::server_response(
-                b"+OK 2 200\r\n",
-                Ok((b"".as_ref(),
-                    Some(Message {
-                            error_flags: ErrorFlag::none(),
-                            inner: InnerMessage::Response(Response {
-                                status: Status::OK,
-                                header: b"2 200".to_vec(),
-                                data: vec![],
-                            }),
-                        },
-                    ),
-                ))),
-        case::server_response_multiline(
-            b"+OK Capability list follows\r\nTOP\r\nUSER\r\nUIDL\r\n.\r\n",
-            Ok((b"".as_ref(),
-                Some(Message {
-                        error_flags: ErrorFlag::none(),
-                        inner: InnerMessage::Response(Response {
-                            status: Status::OK,
-                            header: b"Capability list follows".to_vec(),
-                            data: vec![
-                                b"TOP".to_vec(),
-                                b"USER".to_vec(),
-                                b"UIDL".to_vec(),
-                            ],
-                        }),
-                    },
-                ),
-            ))),
-        case::server_response_multline_byte_stuffing(
-            b"+OK 120 octets\r\n\
-            Grocery list:\r\n\
-            ..6kg of flour\r\n\
-            .\r\n",
-            Ok((b"".as_ref(),
-                Some(Message {
-                        error_flags: ErrorFlag::none(),
-                        inner: InnerMessage::Response(Response {
-                            status: Status::OK,
-                            header: b"120 octets".to_vec(),
-                            data: vec![
-                                b"Grocery list:".to_vec(),
-                                b".6kg of flour".to_vec(),
-                            ],
-                        }),
-                    },
-                ),
-            ))),
+    )]
+    fn test_parse_request(input: &[u8], expected: Result<(&[u8], Option<Message>)>) {
+        let pop3 = POP3 {};
+        assert_eq!(pop3.parse(input, Direction::ToServer), expected);
+    }
+
+    #[rstest(
+        input,
+        expected,
+        case::empty(b"", ProbeStatus::Incomplete),
+        case::incomplete_request(b"TOP", ProbeStatus::Incomplete),
+        case::incomplete_response_ok(b"+OK", ProbeStatus::Incomplete),
+        case::incomplete_response_err(b"-ERR", ProbeStatus::Incomplete),
+        case::unknown_keyword(b"HELLO WORLD\r\n", ProbeStatus::Unrecognized),
+        case::quit(b"QUIT\r\n", ProbeStatus::Recognized),
+        case::incorrect_arguments(b"QUIT ARG\r\n", ProbeStatus::Unrecognized),
+        case::command_too_long(
+            b"PASS 12345678901234567890123456789012345678901234567890\
+            123456789012345678901234567890123456789012345678901234567890\
+            123456789012345678901234567890123456789012345678901234567890\
+            123456789012345678901234567890123456789012345678901234567890\
+            123456789012345678901234567890123456789012345678901234567890\r\n",
+            ProbeStatus::Unrecognized
+        ),
         case::server_response_too_long(
             b"-ERR 12345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890 \
-            123456789012345678901234567890123456789012345678901234567890\r\n",
-            Ok((b"".as_ref(),
-                Some(Message {
-                        error_flags: ErrorFlag::ResponseTooLong.into(),
-                        inner: InnerMessage::Response(Response {
-                            status: Status::ERR,
-                            header: b"12345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890 \
-                                    123456789012345678901234567890123456789012345678901234567890"
-                                    .to_vec(),
-                            data: vec![],
-                        }),
-                    },
-                ),
-            ))),
-        case::server_response_invalid_status(
-            b"+SUCCESS 2 200\r\n",
-            Err(Error::parse(Some("Keyword is response".to_string())))),
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890 \
+        123456789012345678901234567890123456789012345678901234567890\r\n",
+            ProbeStatus::Unrecognized
+        )
     )]
-    fn test_parse(input: &[u8], expected: Result<(&[u8], Option<Message>)>) {
+    fn test_probe(input: &[u8], expected: ProbeStatus) {
         let pop3 = POP3 {};
-        assert_eq!(pop3.parse(input, Direction::Unknown), expected);
+        assert_eq!(pop3.probe(input, Direction::Unknown), expected);
     }
 }
