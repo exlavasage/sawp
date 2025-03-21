@@ -47,7 +47,6 @@
 //! ```
 
 use nom::branch::alt;
-use nom::character::complete::alphanumeric1;
 /// Re-export of the `Flags` struct that is used to represent bit flags
 /// in this crate.
 pub use sawp_flags::{Flag, Flags};
@@ -68,7 +67,7 @@ use sawp_ffi::GenerateFFI;
 use nom::bytes::streaming::tag;
 use nom::character::streaming::{alpha1, char, crlf, not_line_ending, space1};
 use nom::combinator::{eof, map, opt, peek};
-use nom::multi::{many_till, separated_list0};
+use nom::multi::many_till;
 use nom::sequence::{delimited, terminated};
 use std::convert::TryFrom;
 
@@ -128,8 +127,6 @@ impl TryFrom<&[u8]> for Keyword {
     fn try_from(cmd: &[u8]) -> Result<Self> {
         if cmd.is_empty() {
             Err(Error::parse(Some("Empty Keyword".to_string())))
-        } else if cmd[0] == b'+' {
-            Err(Error::parse(Some("Keyword is response".to_string())))
         } else {
             match cmd {
                 b"QUIT" => Ok(Keyword::QUIT),
@@ -148,13 +145,7 @@ impl TryFrom<&[u8]> for Keyword {
                 b"STLS" => Ok(Keyword::STLS),
                 b"AUTH" => Ok(Keyword::AUTH),
                 b"SASL" => Ok(Keyword::SASL),
-                _ => {
-                    if cmd.iter().all(|b| b.is_ascii_alphanumeric()) {
-                        Ok(Keyword::Unknown(std::str::from_utf8(cmd).unwrap().into()))
-                    } else {
-                        Err(Error::parse(Some("Invalid Keyword".to_string())))
-                    }
-                }
+                _ => Ok(Keyword::Unknown(std::str::from_utf8(cmd).unwrap().into())),
             }
         }
     }
@@ -317,8 +308,13 @@ impl POP3 {
         let (input, raw_keyword) = terminated(alpha1, opt(space1))(input)?;
         let keyword = Keyword::try_from(raw_keyword)?;
 
-        let (input, args) = separated_list0(space1, alphanumeric1)(input)?;
-        let (input, _) = crlf(input)?;
+        let (input, raw_args) = terminated(not_line_ending, crlf)(input)?;
+        let args: Vec<Vec<u8>> = raw_args
+            .split(|&x| x == b' ')
+            .map(|x| x.to_vec())
+            .filter(|x| !x.is_empty())
+            .collect();
+
         let args: Vec<Vec<u8>> = args.iter().map(|x| x.to_vec()).collect();
 
         // Apply IncorrectArgumentNum flag if necessary, depending on the specific client command used
@@ -359,10 +355,7 @@ impl POP3 {
             Keyword::Unknown(_) => flags |= ErrorFlag::UnknownKeyword,
         }
 
-        let args_len = args
-            .iter()
-            .fold(0, |acc, c| acc + c.len() + 1 /* for space seperator */);
-        if POP3::client_command_too_long(raw_keyword.len(), args_len) {
+        if POP3::client_command_too_long(raw_keyword.len(), raw_args.len()) {
             flags |= ErrorFlag::CommandTooLong;
         }
 
@@ -432,7 +425,7 @@ impl<'a> Parse<'a> for POP3 {
 mod tests {
     use super::*;
     use rstest::rstest;
-    use sawp::error::Error;
+    use sawp::error::{Error, NomError};
 
     #[test]
     fn test_name() {
@@ -544,7 +537,7 @@ mod tests {
         ))),
     case::server_response_invalid_status(
         b"+SUCCESS 2 200\r\n",
-        Err(Error::parse(Some("Keyword is response".to_string())))),
+        Err(Error::from(NomError::new(b"" as &[u8], nom::error::ErrorKind::Tag)))),
     )]
     fn test_parse_response(input: &[u8], expected: Result<(&[u8], Option<Message>)>) {
         let pop3 = POP3 {};
@@ -572,9 +565,7 @@ mod tests {
             ))),
         case::invalid_keyword(
             b"\x01\x02\x03\0x04 WORLD\r\n", 
-            Err(
-                Error::parse(Some("Invalid Keyword".to_string()))
-            )),
+            Err(Error::from(NomError::new(b"" as &[u8], nom::error::ErrorKind::Alpha)))),
         case::no_args(
             b"CAPA\r\n",
             Ok((b"".as_ref(),
@@ -611,6 +602,19 @@ mod tests {
                             args: vec![
                                 b"sawp".to_vec(),
                                 b"05aaf79d37225973a00cddaaf568eb96".to_vec(),
+                            ],
+                        }),
+                    },
+                ),
+            ))),
+        case::non_alphanum_args(b"USER moises.nunez@ingenierianumar.com\r\n",
+            Ok((b"".as_ref(),
+                Some(Message {
+                        error_flags: ErrorFlag::none(),
+                        inner: InnerMessage::Command(Command {
+                            keyword: Keyword::USER,
+                            args: vec![
+                                b"moises.nunez@ingenierianumar.com".to_vec(),
                             ],
                         }),
                     },
